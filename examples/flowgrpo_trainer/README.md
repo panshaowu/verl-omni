@@ -25,13 +25,13 @@ Place the raw dataset under `$WORKSPACE/data/ocr` (where `WORKSPACE` defaults to
 ```bash
 python3 examples/flowgrpo_trainer/data_process/qwenimage_ocr.py \
   --input_dir $WORKSPACE/data/ocr \
-  --output_dir $WORKSPACE/data/ocr
+  --output_dir $WORKSPACE/data/ocr/qwen_image
 ```
 
 This produces:
 
-- `$WORKSPACE/data/ocr/train.parquet`
-- `$WORKSPACE/data/ocr/test.parquet`
+- `$WORKSPACE/data/ocr/qwen_image/train.parquet`
+- `$WORKSPACE/data/ocr/qwen_image/test.parquet`
 
 ## Prepare the models
 
@@ -46,6 +46,10 @@ Launch the example from the repository root:
 ```bash
 bash examples/flowgrpo_trainer/run_qwen_image_ocr_lora.sh
 ```
+
+GPU training defaults to matched FA3 in config (`attn_backend: _flash_3_varlen_hub`; rollout
+`DIFFUSION_ATTENTION_BACKEND=FLASH_ATTN` is set by `main_diffusion` when FA3 is available).
+Training falls back to native/SDPA if FA3 deps are unavailable.
 
 Optional KL loss tuning:
 
@@ -104,6 +108,31 @@ We have provided a script to enable non-cfg full-weight Qwen-Image OCR training.
 bash examples/flowgrpo_trainer/run_qwen_image_ocr.sh
 ```
 
+An NPU script for Atlas A3 with 16 NPUs is also provided. Before running, set the `ASCEND_HOME_PATH` environment variable (defaults to `/usr/local/Ascend/cann-9.0.0`).
+
+```bash
+bash examples/flowgrpo_trainer/run_qwen_image_ocr_npu.sh
+```
+
+### VeOmni engine backend
+
+The diffusion trainer defaults to FSDP2. To use [VeOmni](https://github.com/ByteDance-Seed/VeOmni) as the actor/reference engine instead, first follow the [VeOmni install instructions](../../docs/start/install.md#optional-engine-backends) (vllm 0.20.2 needs torch 2.11, which conflicts with veomni's pinned `[gpu]` extra — the doc covers the workaround), then run the VeOmni counterpart of the full-weight recipe:
+
+```bash
+bash examples/flowgrpo_trainer/run_qwen_image_ocr_veomni.sh
+```
+
+`run_qwen_image_ocr_veomni.sh` is intentionally a line-for-line mirror of `run_qwen_image_ocr.sh` and differs only in the engine-selection overrides:
+
+| Override | FSDP2 (default) | VeOmni |
+|---|---|---|
+| `diffusion/model_engine=` | _(unset; uses `dp_diffusion`)_ | `veomni_diffusion` |
+| `actor_rollout_ref.actor.strategy=` | `fsdp2` | `veomni` |
+| Actor engine config block | `actor.fsdp_config.*` | `actor.veomni_config.*` |
+| Sequence-parallel field | `fsdp_config.ulysses_sequence_parallel_size` | `veomni_config.ulysses_parallel_size` |
+| Ref engine config block | `ref.fsdp_config.*` | `ref.veomni_config.*` |
+
+The two backends are not configured by the same Hydra keys, so do not mix `fsdp_config` and `veomni_config` overrides in a single run — `diffusion/model_engine=...` selects the schema, and overrides for the other engine will be rejected as unknown keys.
 
 ## Performance
 

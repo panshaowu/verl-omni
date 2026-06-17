@@ -17,7 +17,9 @@ import os
 from dataclasses import asdict
 from typing import Any, Optional
 
+import numpy as np
 import ray
+import torch
 import torchvision.transforms as T
 import vllm_omni.entrypoints.cli.serve
 from verl.utils.config import omega_conf_to_dataclass
@@ -40,7 +42,6 @@ from vllm_omni.lora.request import LoRARequest
 from vllm_omni.outputs import OmniRequestOutput
 
 from verl_omni.pipelines.model_base import VllmOmniPipelineBase
-from verl_omni.utils.vllm_omni import VLLMOmniHijack
 from verl_omni.workers.config import DiffusionModelConfig, DiffusionRolloutConfig
 from verl_omni.workers.rollout.replica import DiffusionOutput
 
@@ -100,7 +101,15 @@ class vLLMOmniHttpServer(vLLMHttpServer):
         engine_args = OmniEngineArgs.from_cli_args(args)
         engine_args = asdict(engine_args)
 
+        # inject multi-stage yaml config
+        deploy_config = getattr(args, "deploy_config", None)
+        if deploy_config:
+            engine_args["deploy_config"] = deploy_config
+
         import_external_libs(self.config.external_lib)
+
+        self.config.resolve_algorithm(self.model_config)
+
         pipeline_path = VllmOmniPipelineBase.get_pipeline_path(
             architecture=self.model_config.architecture,
             algorithm=self.model_config.algorithm,
@@ -110,6 +119,9 @@ class vLLMOmniHttpServer(vLLMHttpServer):
             engine_args["enable_dummy_pipeline"] = True
             engine_args["custom_pipeline_args"] = {"pipeline_class": pipeline_path}
 
+        if self.config.step_execution:
+            engine_args["step_execution"] = True
+
         diffusion_master_port, diffusion_master_sock = get_free_port("127.0.0.1", with_alive_sock=True)
         diffusion_master_sock.close()
 
@@ -117,8 +129,6 @@ class vLLMOmniHttpServer(vLLMHttpServer):
         os.environ["MASTER_PORT"] = str(diffusion_master_port)
         logger.info("Using MASTER_PORT=%s for vLLM-Omni diffusion workers", os.environ["MASTER_PORT"])
 
-        # Apply before AsyncOmni builds OmniDiffusionConfig in this process.
-        VLLMOmniHijack.hijack()
         engine_client = AsyncOmni(**engine_args)
         app = build_app(args)
         await omni_init_app_state(engine_client, app.state, args)
@@ -137,6 +147,23 @@ class vLLMOmniHttpServer(vLLMHttpServer):
 
     def _get_wake_up_tags(self) -> list[str]:
         return ["weights"]
+
+    async def wake_up(self, tags: list[str] | None = None):
+        """Override parent to use collective_rpc instead of engine.wake_up().
+
+        The parent (verl ``1927ad33``+) calls ``self.engine.wake_up(tags=...)``
+        which triggers CUDA initialisation in this HTTP server process when
+        running under vLLM-Omni (AsyncOmni engine).
+        Use ``collective_rpc`` instead.
+
+        # TODO (long): drop this override once vllm-omni wake_up
+        without triggering GPU initialisation.
+        """
+        if self.node_rank != 0:
+            return
+        await self.engine.collective_rpc(
+            "wake_up", kwargs={"tags": tags if tags is not None else self._get_wake_up_tags()}
+        )
 
     async def _sleep_hybrid(self):
         """Preserve non-actor pipeline weights during hybrid training sleep.
@@ -160,10 +187,12 @@ class vLLMOmniHttpServer(vLLMHttpServer):
         image_data: Optional[list[Any]] = None,
         video_data: Optional[list[Any]] = None,
         negative_prompt_ids: Optional[list[int]] = None,
+        prompt_mask: torch.BoolTensor | None = None,
         priority: int = 0,
     ) -> DiffusionOutput:
         """Generate sequence with token-in-image-out."""
         prompt_ids = normalize_token_ids(prompt_ids)
+        default_params_list = self.engine.default_sampling_params_list
 
         multi_modal_data = {}
         if image_data is not None:
@@ -182,10 +211,16 @@ class vLLMOmniHttpServer(vLLMHttpServer):
                 )
 
         # Build OmniCustomPrompt with pre-tokenized IDs
-        custom_prompt: OmniCustomPrompt = {"prompt_ids": prompt_ids}
+        custom_prompt: OmniCustomPrompt = {"prompt_token_ids": prompt_ids}
+        if prompt_mask is not None:
+            custom_prompt["prompt_mask"] = prompt_mask
+        if len(default_params_list) > 1:
+            # Multi-stage pipelines tag the diffusion stage so the orchestrator can route inputs correctly.
+            custom_prompt["modalities"] = ["image"]
         if negative_prompt_ids is not None:
             custom_prompt["negative_prompt_ids"] = negative_prompt_ids
         if multi_modal_data:
+            custom_prompt["multi_modal_data"] = multi_modal_data
             custom_prompt["extra_args"] = {"multi_modal_data": multi_modal_data}
 
         # Build OmniDiffusionSamplingParams from the incoming dict
@@ -201,11 +236,14 @@ class vLLMOmniHttpServer(vLLMHttpServer):
             sampling_kwargs["lora_request"] = lora_request
         diffusion_sampling_params = OmniDiffusionSamplingParams(**sampling_kwargs)
 
+        # Build sampling params list: multi-stage models use defaults for non-diffusion stages
+        sampling_params_list = default_params_list[:-1] + [diffusion_sampling_params]
+
         # Call AsyncOmni.generate() with the correct API
         generator = self.engine.generate(
             prompt=custom_prompt,
             request_id=request_id,
-            sampling_params_list=[diffusion_sampling_params],
+            sampling_params_list=sampling_params_list,
         )
 
         # Get final response
@@ -213,8 +251,13 @@ class vLLMOmniHttpServer(vLLMHttpServer):
         async for output in generator:
             final_res = output
         assert final_res is not None
-
-        diffusion_output = self._to_tensor(final_res.images[0]).float() / 255.0
+        diffusion_output = final_res.images[0]
+        if isinstance(diffusion_output, torch.Tensor):
+            diffusion_output = diffusion_output.float()
+        elif isinstance(diffusion_output, np.ndarray):
+            diffusion_output = torch.from_numpy(diffusion_output).float()
+        else:
+            diffusion_output = self._to_tensor(diffusion_output).float() / 255.0
 
         # Extract extra data from custom_output (populated by DiffusionEngine)
         mm_output = final_res.custom_output or {}
@@ -231,10 +274,15 @@ class vLLMOmniHttpServer(vLLMHttpServer):
         prompt_embeds_mask = mm_output.get("prompt_embeds_mask")
         negative_prompt_embeds = mm_output.get("negative_prompt_embeds")
         negative_prompt_embeds_mask = mm_output.get("negative_prompt_embeds_mask")
+        latents_clean = mm_output.get("latents_clean")
+        train_timesteps = mm_output.get("train_timesteps")
 
+        # TODO(andy): refactor later.
         extra_fields = {
             "all_latents": all_latents[0] if all_latents is not None else None,
             "all_timesteps": all_timesteps[0] if all_timesteps is not None else None,
+            "latents_clean": latents_clean[0] if latents_clean is not None else None,
+            "train_timesteps": train_timesteps[0] if train_timesteps is not None else None,
             "prompt_embeds": prompt_embeds[0] if prompt_embeds is not None else None,
             "prompt_embeds_mask": prompt_embeds_mask[0] if prompt_embeds_mask is not None else None,
             "negative_prompt_embeds": negative_prompt_embeds[0] if negative_prompt_embeds is not None else None,

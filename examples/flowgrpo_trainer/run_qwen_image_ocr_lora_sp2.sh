@@ -4,8 +4,8 @@ set -x
 # Set WORKSPACE to any writable directory; defaults to $HOME
 WORKSPACE=${WORKSPACE:-$HOME}
 
-ocr_train_path=$WORKSPACE/data/ocr/train.parquet
-ocr_test_path=$WORKSPACE/data/ocr/test.parquet
+ocr_train_path=$WORKSPACE/data/ocr/qwen_image/train.parquet
+ocr_test_path=$WORKSPACE/data/ocr/qwen_image/test.parquet
 
 model_name=Qwen/Qwen-Image
 reward_model_name=Qwen/Qwen3-VL-8B-Instruct
@@ -19,6 +19,8 @@ REWARD_TP=4
 ENGINE=vllm_omni
 REWARD_ENGINE=vllm
 
+# Match actor native backend with vLLM-Omni rollout SDPA backend.
+export DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA
 
 python3 -m verl_omni.trainer.main_diffusion \
     data.train_files=$ocr_train_path \
@@ -27,6 +29,8 @@ python3 -m verl_omni.trainer.main_diffusion \
     data.max_prompt_length=256 \
     actor_rollout_ref.model.algorithm=flow_grpo \
     actor_rollout_ref.model.path=$model_name \
+    actor_rollout_ref.model.attn_backend=native \
+    +ray_kwargs.ray_init.runtime_env.env_vars.DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA \
     actor_rollout_ref.model.lora_rank=64 \
     actor_rollout_ref.model.lora_alpha=128 \
     actor_rollout_ref.model.target_modules="['to_q','to_k','to_v','to_out.0','add_q_proj','add_k_proj','add_v_proj','to_add_out','img_mlp.net.0.proj','img_mlp.net.2','txt_mlp.net.0.proj','txt_mlp.net.2']" \

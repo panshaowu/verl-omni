@@ -65,6 +65,9 @@ class DiffusionPipelineConfig(BaseConfig):
     max_sequence_length: int = 512
     guidance_scale: Optional[float] = None
 
+    # Wan2.2 video generation: number of frames (81 = ~3s at 24fps)
+    num_frames: int = 1
+
 
 @dataclass
 class DiffusionSamplingConfig(BaseConfig):
@@ -84,6 +87,10 @@ class DiffusionRolloutConfig(BaseConfig):
     nnodes: int = 0
     n_gpus_per_node: int = 8
     n: int = 1
+
+    # Base seed for deterministic training rollout RNG. Per-step base is
+    # ``seed + global_step - 1``. null disables rollout seeding.
+    seed: Optional[int] = None
 
     prompt_length: int = 512
 
@@ -105,6 +112,10 @@ class DiffusionRolloutConfig(BaseConfig):
     max_model_len: Optional[int] = None
     max_num_seqs: int = 1024
 
+    # When True, the vLLM-Omni engine runs in step-execution mode and selects
+    # the *_stepwise variant of the pipeline (e.g. flow_grpo_stepwise).
+    step_execution: bool = False
+
     # note that the logprob computation should belong to the actor
     log_prob_micro_batch_size_per_gpu: Optional[int] = None
 
@@ -115,6 +126,7 @@ class DiffusionRolloutConfig(BaseConfig):
     pipeline: DiffusionPipelineConfig = field(default_factory=DiffusionPipelineConfig)
 
     calculate_log_probs: bool = False
+    rollout_adapter: str = "default"
 
     agent: AgentLoopConfig = field(default_factory=AgentLoopConfig)
 
@@ -159,9 +171,27 @@ class DiffusionRolloutConfig(BaseConfig):
                 "Rollout mode 'sync' has been removed. Please set "
                 "`actor_rollout_ref.rollout.mode=async` or remove the mode setting entirely."
             )
+        if self.rollout_adapter not in ("default", "old"):
+            raise ValueError(
+                f"Invalid diffusion rollout rollout_adapter: {self.rollout_adapter}. Must be one of ['default', 'old']."
+            )
 
         if self.pipeline_model_parallel_size > 1:
             if self.name == "vllm_omni":
                 raise NotImplementedError(
                     f"Current rollout {self.name=} not implemented pipeline_model_parallel_size > 1 yet."
                 )
+
+    def resolve_algorithm(self, model_config) -> None:
+        """Update model_config.algorithm to the _stepwise variant when step_execution is enabled.
+
+        When ``step_execution=True`` and a ``<algorithm>_stepwise`` pipeline class is registered
+        for the given architecture, model_config.algorithm is updated in-place so that the engine
+        uses the experimental prepare_encode / step_scheduler / post_decode overrides.
+        """
+        if self.step_execution:
+            from verl_omni.pipelines.model_base import VllmOmniPipelineBase
+
+            stepwise = f"{model_config.algorithm}_stepwise"
+            if VllmOmniPipelineBase.get_class(model_config.architecture, stepwise):
+                model_config.algorithm = stepwise

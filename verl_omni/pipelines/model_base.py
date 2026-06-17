@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 from abc import ABC, abstractmethod
 from typing import Optional
 
@@ -20,6 +21,8 @@ from diffusers import ModelMixin, SchedulerMixin
 from tensordict import TensorDict
 
 from verl_omni.workers.config import DiffusionModelConfig
+
+logger = logging.getLogger(__name__)
 
 
 class DiffusionModelBase(ABC):
@@ -67,6 +70,15 @@ class DiffusionModelBase(ABC):
             import_external_libs(model_config.external_lib)
 
         try:
+            if architecture == "QwenImagePipeline":
+                logger.info(
+                    "Applying monkey-patch for QwenImageTransformer2DModel Ulysses SP "
+                    "This workaround will be removed once we upgrade to a diffusers release that "
+                    "includes the upstream fix."
+                )
+                from verl_omni.models.diffusers.qwen_image import apply_qwen_image_ulysses_mask_fix
+
+                apply_qwen_image_ulysses_mask_fix()
             return cls._registry[key]
         except KeyError:
             registered = sorted(cls._registry.keys())
@@ -75,6 +87,15 @@ class DiffusionModelBase(ABC):
                 f"algorithm={algorithm!r}). Registered: {registered}. "
                 f"Set ``external_lib`` in DiffusionModelConfig to load your implementation."
             ) from None
+
+    @classmethod
+    def build_module(cls, model_config: DiffusionModelConfig, torch_dtype: torch.dtype) -> Optional[torch.nn.Module]:
+        """Load the model without ``diffusers.AutoModel``.
+
+        Return ``None`` to use the default ``AutoModel`` path.
+        Override this for models that diffusers cannot load.
+        """
+        return None
 
     @classmethod
     @abstractmethod
@@ -113,16 +134,22 @@ class DiffusionModelBase(ABC):
         negative_prompt_embeds_mask: torch.Tensor,
         micro_batch: TensorDict,
         step: int,
-    ) -> tuple[dict, dict]:
-        """Build architecture-specific model inputs for the forward pass.
+    ) -> tuple[dict, Optional[dict]]:
+        """Build architecture-specific inputs for a model forward.
+        For reverse-trajectory algorithms, ``latents`` and ``timesteps`` usually
+        contain the full rollout trajectory and ``step`` selects the current
+        slice. For forward-process objectives, callers may pass an already
+        selected/noised latent and timestep directly.
         The caller is responsible for universal pre-processing (common tensor extraction
         and nested-embed unpadding) before invoking this method.
 
         Args:
             module (ModelMixin): the diffusion transformer module.
             model_config (DiffusionModelConfig): the configuration of the diffusion model.
-            latents (torch.Tensor): full latent tensor from the micro-batch, shape (B, T, ...).
-            timesteps (torch.Tensor): full timestep tensor from the micro-batch, shape (B, T).
+            latents (torch.Tensor): latent tensor from the micro-batch; either a full trajectory
+                of shape (B, T, ...) or a selected/noised latent of shape (B, ...).
+            timesteps (torch.Tensor): timestep tensor from the micro-batch; either a full
+                trajectory of shape (B, T) or a selected timestep of shape (B,).
             prompt_embeds (torch.Tensor): dense positive prompt embeddings, shape (B, L, D).
             prompt_embeds_mask (torch.Tensor): attention mask for prompt_embeds, shape (B, L).
             negative_prompt_embeds (torch.Tensor): dense negative prompt embeddings, shape (B, L, D).
@@ -162,6 +189,23 @@ class DiffusionModelBase(ABC):
             tuple: ``(log_prob, prev_sample_mean, std_dev_t, sqrt_dt)``
         """
         pass
+
+    @classmethod
+    def forward(
+        cls,
+        module: ModelMixin,
+        model_config: DiffusionModelConfig,
+        model_inputs: dict[str, torch.Tensor],
+        negative_model_inputs: Optional[dict[str, torch.Tensor]] = None,
+    ) -> torch.Tensor:
+        """Run a single model prediction.
+        Used both for forward-process objectives (noising clean latents ``x0 -> xt``
+        then optimizing predictions directly) and as the prediction step inside
+        reverse-sampling algorithms (FlowGRPO et al.). Model adapters only need to
+        override this when prediction requires extra handling such as CFG, negative
+        inputs, or output conversion.
+        """
+        return module(**model_inputs)[0]
 
 
 class VllmOmniPipelineBase:

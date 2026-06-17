@@ -27,6 +27,7 @@ from verl_omni.trainer.diffusion.ray_diffusion_trainer import (
     DirectPreferenceRayTrainer,
     PolicyGradientRayTrainer,
 )
+from verl_omni.utils.diffusion_attention import fallback_fa3_if_unavailable
 
 
 @hydra.main(config_path="./config", config_name="diffusion_trainer", version_base=None)
@@ -38,6 +39,8 @@ def main(config):
     """
     # Automatically set `config.trainer.device = npu` when running on Ascend NPU.
     auto_set_device(config)
+    OmegaConf.resolve(config)
+    fallback_fa3_if_unavailable(config)
     run_diffusion(config)
 
 
@@ -137,7 +140,9 @@ class TaskRunner:
         ref_in_actor = lora_rank > 0 or config.actor_rollout_ref.model.get("lora_adapter_path") is not None
 
         if config.algorithm.sample_source == "offline":
-            raise NotImplementedError("algorithm.sample_source=offline is not supported yet.")
+            if not hasattr(Role, "Actor"):
+                raise ValueError("Offline training without rollout requires verl Role.Actor support.")
+            role = Role.Actor
         elif need_reference_policy(config) and not ref_in_actor:
             role = Role.ActorRolloutRef
         else:
