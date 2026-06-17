@@ -20,29 +20,13 @@ from verl.workers.rollout.vllm_rollout.utils import VLLM_LORA_INT_ID, VLLM_LORA_
 from vllm_omni.diffusion.worker.diffusion_worker import CustomPipelineWorkerExtension
 
 from verl_omni.utils.vllm_omni import OmniTensorLoRARequest, VLLMOmniHijack
+from verl_omni.workers.rollout.vllm_rollout.npu_utils import NPUColocateWorkerMixin
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
-# Add the NPU mixin only on NPU; on GPU it redefines existing worker methods and
-# trips vLLM v1 multiproc_executor's no-attribute-redefinition assertion.
-def _platform_extension_bases():
-    # TODO: the NPU (Ascend) path below is not yet verified on real NPU hardware;
-    #       only the GPU branch is exercised by current tests / training runs.
-    try:
-        from vllm.platforms import current_platform
-
-        if current_platform.device_type == "npu":
-            from verl_omni.workers.rollout.vllm_rollout.npu_utils import NPUColocateWorkerMixin
-
-            return (NPUColocateWorkerMixin, CustomPipelineWorkerExtension)
-    except Exception:
-        pass
-    return (CustomPipelineWorkerExtension,)
-
-
-class vLLMOmniColocateWorkerExtension(*_platform_extension_bases()):
+class vLLMOmniColocateWorkerExtension(CustomPipelineWorkerExtension):
     """
     The class for vLLM-Omni's worker to inherit from, in the colocate setting.
     By defining an extension class, the code can work no matter what is
@@ -53,7 +37,6 @@ class vLLMOmniColocateWorkerExtension(*_platform_extension_bases()):
 
     Feature support:
     1. LoRA
-    2. NPU (Ascend) memory-pool, sleep, and wake_up — via NPUColocateWorkerMixin
     """
 
     def __new__(cls, **kwargs):
@@ -181,3 +164,11 @@ class vLLMOmniColocateWorkerExtension(*_platform_extension_bases()):
         replica_rank = os.environ.get("VERL_REPLICA_RANK", "0")
         job_id = os.environ.get("VERL_RAY_JOB_ID", "0")
         return f"ipc:///tmp/rl-colocate-zmq-{job_id}-replica-{replica_rank}-rank-{self.local_rank}.sock"
+
+
+class vLLMOmniNPUColocateWorkerExtension(vLLMOmniColocateWorkerExtension, NPUColocateWorkerMixin):
+    """
+    Extends the base extension with NPUColocateWorkerMixin to support
+    NPU (Ascend) memory-pool, sleep, and wake_up.
+    """
+    pass
