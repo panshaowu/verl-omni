@@ -25,6 +25,40 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
+def _undo_ascend_fused_moe_transform(model: torch.nn.Module) -> None:
+    """Restore ``weight_loader`` on Ascend MoE expert params before IPC reload.
+
+    ``AscendUnquantizedFusedMoEMethod.process_weights_after_loading`` *replaces*
+    the fused-expert params (``w13_weight`` / ``w2_weight``) with fresh
+    ``torch.nn.Parameter`` objects, which drops the ``weight_loader`` attribute
+    that ``Qwen3MoeModel.load_weights`` dispatches expert weights through
+    (``param.weight_loader``). Without it the actor→rollout IPC weight sync
+    crashes with ``'Parameter' object has no attribute 'weight_loader'``.
+
+    The replacement leaves the params in the original ``create_weights`` layout
+    the FusedMoE ``weight_loader`` expects, so we only need to re-attach the
+    layer's ``weight_loader`` (do NOT transpose — that corrupts the layout and
+    causes a shape mismatch on scatter). The subsequent
+    ``process_weights_after_loading`` pass re-applies the Ascend transform for
+    the kernel. No-op on non-Ascend or already-loadable params.
+    """
+    try:
+        from vllm.model_executor.layers.fused_moe.layer import FusedMoE
+    except ImportError:
+        return
+    for module in model.modules():
+        if not isinstance(module, FusedMoE):
+            continue
+        weight_loader = getattr(module, "weight_loader", None)
+        if weight_loader is None:
+            continue
+        for pname in ("w13_weight", "w2_weight"):
+            param = getattr(module, pname, None)
+            if param is None or hasattr(param, "weight_loader"):
+                continue
+            param.weight_loader = weight_loader
+
+
 class vLLMOmniColocateWorkerExtension(CustomPipelineWorkerExtension):
     """
     The class for vLLM-Omni's worker to inherit from, in the colocate setting.
@@ -144,6 +178,12 @@ class vLLMOmniColocateWorkerExtension(CustomPipelineWorkerExtension):
                 # model.load_weights (no per-bucket finalize), then run the single
                 # post-load processing pass once all buckets are received.
                 model, model_config = standard
+                # Ascend: undo the expert transpose applied by
+                # AscendUnquantizedFusedMoEMethod.process_weights_after_loading
+                # (which drops param.weight_loader) so model.load_weights can
+                # dispatch expert weights. process_weights_after_loading below
+                # re-applies the transpose for the Ascend kernel.
+                _undo_ascend_fused_moe_transform(model)
                 receiver.receive_weights(on_bucket_received=lambda weights: model.load_weights(weights))
                 from vllm.model_executor.model_loader.utils import process_weights_after_loading
 

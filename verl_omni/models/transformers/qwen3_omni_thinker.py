@@ -115,6 +115,19 @@ def _register_qwen3_omni_automodel() -> None:
             pass
 
     Qwen3OmniMoeConfig.tie_word_embeddings = _FalseTieDescriptor()
+
+    # verl's ``apply_monkey_patch`` reads ``model.config.text_config.num_attention_heads``
+    # / ``num_key_value_heads``. ``Qwen3OmniMoeConfig`` nests the decoder LM config under
+    # ``thinker_config.text_config`` and only exposes it via ``get_text_config()``, so
+    # expose a read-only ``text_config`` property that delegates there. (Using the
+    # explicit ``thinker_config.text_config`` path avoids any recursion through
+    # ``get_text_config`` implementations that may consult ``self.text_config``.)
+    @property
+    def _qwen3_omni_text_config(self):
+        return self.thinker_config.text_config
+
+    Qwen3OmniMoeConfig.text_config = _qwen3_omni_text_config
+
     AutoModelForCausalLM.register(Qwen3OmniMoeConfig, Qwen3OmniMoeForConditionalGeneration)
 
 
